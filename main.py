@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time as monotonic_time
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime, time, timedelta
@@ -28,6 +29,7 @@ from .importer import (
     SUPPORTED,
     SYSTEM_PROMPT,
     ImportProblem,
+    explicit_week_anchor,
     extract,
     parse_model_result,
     validate_ics,
@@ -186,16 +188,19 @@ class CoursePlugin(Star):
                     if caption.startswith("课表补充 "):
                         calendar_hint = caption.removeprefix("课表补充 ").strip()[:800]
                         await evt.send(evt.plain_result("已记录本次导入的日期或作息补充，请发送附件。"))
+                    elif "时间" in caption[:4000] and "周次" in caption[:4000]:
+                        await evt.send(evt.plain_result("请发送课表附件（ICS、Excel、Word、PDF、JSON、HTML 或图片）；日期补充可单独发送。"))
                     return
                 if len(attachments) != 1:
                     await evt.send(evt.plain_result("请每次发送一份附件或一张课表图片。"))
                     return
-                controller.keep(timeout=95, reset_timeout=True)
+                if controller.future.done():
+                    return
+                controller.keep(timeout=300, reset_timeout=True)
                 try:
-                    async with asyncio.timeout(90):
-                        content, periods_trusted = await self._extract_schedule(
-                            evt, attachments[0], "\n".join(value for value in (calendar_hint, caption) if value),
-                        )
+                    content, periods_trusted = await self._extract_schedule(
+                        evt, attachments[0], "\n".join(value for value in (calendar_hint, caption) if value),
+                    )
                     if controller.future.done():
                         return
                     binding = self._storage.store_calendar(
@@ -206,11 +211,13 @@ class CoursePlugin(Star):
                         self._parser.clear_cache(str((self._storage._base_dir / existing.ics_file).resolve()))
                 except ImportProblem as exc:
                     message = str(exc)
+                except _ImportStageTimeout as exc:
+                    message = str(exc)
                 except TimeoutError:
-                    message = "下载或识别超时，请重试。"
+                    message = "课表处理超时，请重试。"
                 except Exception as exc:
                     logger.warning(f"[course] import failed ({type(exc).__name__})")
-                    message = "读取或识别失败。请检查附件格式和当前会话的模型配置。"
+                    message = "读取或识别失败。请检查附件格式、插件模型配置和模型服务连通性。"
                 else:
                     controller.stop()
                     tip = ("本群课前提醒已开启。" if origin in _reminder_targets(binding) and evt.get_group_id()
@@ -241,7 +248,7 @@ class CoursePlugin(Star):
             if suffix not in allowed:
                 raise ImportProblem("附件格式不适用于当前命令。")
             previous_path = getattr(attachment, "file_", None)
-            path = await attachment.get_file()
+            path = await _run_import_stage("附件下载", attachment.get_file(), 30)
             if getattr(attachment, "file_", None) != previous_path:
                 cleanup_prefix = "fileseg_"
         else:
@@ -249,7 +256,7 @@ class CoursePlugin(Star):
             source = attachment.url or attachment.file or ""
             if source.startswith("base64://") and len(source) > 9 + ((MAX_BYTES + 2) // 3) * 4:
                 raise ImportProblem("图片超过 12 MiB。")
-            path = await attachment.convert_to_file_path()
+            path = await _run_import_stage("附件下载", attachment.convert_to_file_path(), 30)
             if source.startswith(("http://", "https://")):
                 cleanup_prefix = "io_temp_img_"
             elif source.startswith("base64://"):
@@ -273,22 +280,29 @@ class CoursePlugin(Star):
         self, event: AstrMessageEvent, attachment: File | Image, caption: str,
     ) -> tuple[bytes, bool]:
         async with self._schedule_attachment(attachment, SUPPORTED) as (path, suffix):
-            kind, content = await asyncio.to_thread(extract, path, suffix)
+            kind, content = await _run_import_stage("读取附件", asyncio.to_thread(extract, path, suffix), 25)
             if kind == "ics":
                 data = content.encode("utf-8")
-                await asyncio.to_thread(validate_ics, data)
+                await _run_import_stage("生成课表", asyncio.to_thread(validate_ics, data), 20)
                 return data, False
             prompt = json.dumps(
                 {"日历补充信息": caption[:800], "附件可读数据": content if kind == "text" else ""},
                 ensure_ascii=False,
             )
-            provider = await self._resolve_import_provider(event.unified_msg_origin, image=kind == "image")
-            response = await self._context.llm_generate(
-                chat_provider_id=provider, prompt=prompt, system_prompt=SYSTEM_PROMPT,
-                image_urls=[content] if kind == "image" else None,
-            )
+            anchor = explicit_week_anchor(caption)
+
+            async def recognize():
+                provider = await self._resolve_import_provider(event.unified_msg_origin, image=kind == "image")
+                return await self._context.llm_generate(
+                    chat_provider_id=provider, prompt=prompt, system_prompt=SYSTEM_PROMPT,
+                    image_urls=[content] if kind == "image" else None,
+                )
+
+            response = await _run_import_stage("模型识别", recognize(), 180)
             period_profile = self._storage.get_period_times(event.unified_msg_origin, event.get_sender_id())
-            data = await asyncio.to_thread(parse_model_result, response.completion_text, SHANGHAI_TZ, period_profile)
+            data = await _run_import_stage("生成课表", asyncio.to_thread(
+                parse_model_result, response.completion_text, SHANGHAI_TZ, period_profile, anchor,
+            ), 20)
             return data, True
 
     def _events_for_binding(self, binding: UserBinding) -> list[CourseEvent]:
@@ -393,6 +407,8 @@ class CoursePlugin(Star):
                         return
                     self._storage.save_period_times(origin, user_id, times)
                 except ImportProblem as exc:
+                    message = str(exc)
+                except _ImportStageTimeout as exc:
                     message = str(exc)
                 except TimeoutError:
                     message = "读取作息或图片识别超时。"
@@ -945,6 +961,33 @@ def _is_valid_time_format(time_str: str) -> bool:
     import re
 
     return bool(re.match(r"^([0-1][0-9]|2[0-3]):[0-5][0-9]$", time_str))
+
+class _ImportStageTimeout(TimeoutError):
+    """A bounded import stage expired; its message contains no attachment details."""
+
+
+async def _run_import_stage(name, operation, seconds):
+    started = monotonic_time.monotonic()
+    try:
+        result = await asyncio.wait_for(operation, timeout=seconds)
+    except asyncio.CancelledError:
+        elapsed = monotonic_time.monotonic() - started
+        logger.info(f"[course] import stage={name} elapsed={elapsed:.2f}s outcome=cancelled")
+        raise
+    except TimeoutError as exc:
+        elapsed = monotonic_time.monotonic() - started
+        logger.warning(f"[course] import stage={name} elapsed={elapsed:.2f}s outcome=timeout")
+        raise _ImportStageTimeout(f"{name}超时（{seconds} 秒），请重试。") from exc
+    except Exception as exc:
+        elapsed = monotonic_time.monotonic() - started
+        logger.warning(
+            f"[course] import stage={name} elapsed={elapsed:.2f}s outcome=error error={type(exc).__name__}"
+        )
+        raise
+    elapsed = monotonic_time.monotonic() - started
+    logger.info(f"[course] import stage={name} elapsed={elapsed:.2f}s outcome=ok")
+    return result
+
 
 def _read_period_file(path: str, json_only: bool) -> dict[int, tuple[str, str]]:
     with Path(path).open("rb") as file:

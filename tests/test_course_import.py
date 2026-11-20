@@ -359,6 +359,83 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.context.llm_generate.await_args.kwargs["chat_provider_id"], "chosen")
         self.context.get_current_chat_provider_id.assert_not_awaited()
 
+    async def test_model_timeout_is_bounded_and_names_the_stage(self):
+        import asyncio
+
+        p = self.root / "course.json"
+        p.write_text('{"course":"Math"}', encoding="utf-8")
+        original_wait_for = asyncio.wait_for
+
+        async def short_wait(awaitable, timeout):
+            return await original_wait_for(awaitable, timeout=0.01 if timeout == 180 else timeout)
+
+        async def hanging_model(**kwargs):
+            await asyncio.sleep(1)
+
+        self.context.llm_generate.side_effect = hanging_model
+        with patch.object(plugin.asyncio, "wait_for", short_wait):
+            with self.assertRaisesRegex(TimeoutError, "模型识别超时"):
+                await self.bot._extract_schedule(event(), ComponentFile("course.json", p), "")
+        self.assertFalse(self.storage.get_binding("001"))
+
+    async def test_expired_bind_waiter_does_not_replace_existing_calendar(self):
+        old = self.store()
+        old_data = (self.root / old.ics_file).read_bytes()
+        incoming = ComponentFile("course.json", self.root / "ignored.json")
+        send = AsyncMock()
+
+        def message(parts=()):
+            return SimpleNamespace(
+                **vars(event()), message_str="", get_messages=lambda: parts,
+                plain_result=str, send=send, get_sender_name=lambda: "同学", stop_event=Mock(),
+            )
+
+        controller = SimpleNamespace(
+            future=SimpleNamespace(done=Mock(return_value=False)), stop=Mock(), keep=Mock(),
+        )
+
+        async def late_result(*args):
+            controller.future.done.return_value = True
+            return old_data, True
+
+        def fake_waiter(**kwargs):
+            def decorate(callback):
+                async def run(starter, session_filter):
+                    await callback(controller, message([incoming]))
+                return run
+            return decorate
+
+        extraction = AsyncMock(side_effect=late_result)
+        with patch.object(plugin, "session_waiter", fake_waiter), patch.object(
+            self.bot, "_extract_schedule", extraction
+        ), patch.object(self.storage, "store_calendar", wraps=self.storage.store_calendar) as store:
+            replies = [item async for item in self.bot.bind(message())]
+        self.assertTrue(replies)
+        extraction.assert_awaited_once()
+        store.assert_not_called()
+        send.assert_not_awaited()
+        controller.stop.assert_not_called()
+        self.assertEqual(self.storage.get_binding("001").ics_file, old.ics_file)
+        self.assertEqual((self.root / old.ics_file).read_bytes(), old_data)
+
+    async def test_download_timeout_names_attachment_stage_and_skips_ai(self):
+        import asyncio
+
+        attachment = ComponentFile("course.json", self.root / "never.json")
+        original_wait_for = asyncio.wait_for
+
+        async def short_wait(awaitable, timeout):
+            return await original_wait_for(awaitable, timeout=0.01 if timeout == 30 else timeout)
+
+        async def hanging_download():
+            await asyncio.sleep(1)
+
+        attachment.get_file.side_effect = hanging_download
+        with patch.object(plugin.asyncio, "wait_for", short_wait):
+            with self.assertRaisesRegex(TimeoutError, "附件下载超时"):
+                await self.bot._extract_schedule(event(), attachment, "")
+        self.context.llm_generate.assert_not_awaited()
+
     async def test_missing_selected_provider_fails_without_fallback(self):
         p = self.root / "course.json"
         p.write_text('{"course":"Math"}', encoding="utf-8")
