@@ -59,9 +59,10 @@ def _schedule_render_options() -> Dict[str, object]:
     "1.5.1",
 )
 class CoursePlugin(Star):
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config: Optional[Mapping[str, object]] = None):
         super().__init__(context)
         self._context = context
+        self._plugin_config = config if config is not None else {}
 
         self._storage = CourseStorage(self.name)
         self._parser = IcsParser()
@@ -166,7 +167,7 @@ class CoursePlugin(Star):
         try:
             yield event.plain_result(
                 "请在 120 秒内发送一份课表文件或图片：ICS、Excel、Word (.docx)、PDF、JSON、HTML、PNG/JPG/WEBP。\n"
-                "非 ICS 内容会交给当前会话的模型识别。若课表只有周次，可先发「课表补充 第一周周一 YYYY-MM-DD」；"
+                "非 ICS 内容会交给插件配置的课表解析模型识别（留空则跟随当前会话）。若课表只有周次，可先发「课表补充 第一周周一 YYYY-MM-DD」；"
                 "只有节次时可先用 /课表时间 保存作息。发送「退出」取消。"
             )
 
@@ -281,7 +282,7 @@ class CoursePlugin(Star):
                 {"日历补充信息": caption[:800], "附件可读数据": content if kind == "text" else ""},
                 ensure_ascii=False,
             )
-            provider = await self._context.get_current_chat_provider_id(event.unified_msg_origin)
+            provider = await self._resolve_import_provider(event.unified_msg_origin)
             response = await self._context.llm_generate(
                 chat_provider_id=provider, prompt=prompt, system_prompt=SYSTEM_PROMPT,
                 image_urls=[content] if kind == "image" else None,
@@ -320,7 +321,7 @@ class CoursePlugin(Star):
             if suffix in {".json", ".txt"}:
                 return await asyncio.to_thread(_read_period_file, path, suffix == ".json")
             _, image_path = await asyncio.to_thread(extract, path, suffix)
-            provider = await self._context.get_current_chat_provider_id(event.unified_msg_origin)
+            provider = await self._resolve_import_provider(event.unified_msg_origin)
             answer = await self._context.llm_generate(
                 chat_provider_id=provider,
                 prompt='读取作息表的节次和起止时刻，按 JSON 返回，例如 {"1":["08:00","08:45"]}。',
@@ -329,6 +330,18 @@ class CoursePlugin(Star):
                 image_urls=[image_path],
             )
             return await asyncio.to_thread(parse_period_times, answer.completion_text, json_only=True)
+
+    async def _resolve_import_provider(self, umo: str) -> str:
+        raw_configured = self._plugin_config.get("import_provider_id", "")
+        configured = raw_configured.strip() if isinstance(raw_configured, str) else ""
+        if not configured:
+            return await self._context.get_current_chat_provider_id(umo)
+        providers = self._context.get_all_providers()
+        if not any(provider.meta().id == configured for provider in providers):
+            raise ImportProblem(
+                "插件配置的课表解析模型当前不可用，请在插件配置页选择已启用的聊天模型，或清空该项以跟随当前会话模型。"
+            )
+        return configured
 
     @filter.command("课表时间")
     async def set_period_times(self, event: AstrMessageEvent):

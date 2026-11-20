@@ -237,6 +237,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         storage_module.StarTools.get_data_dir = lambda name: self.root
         self.context = SimpleNamespace(
             get_current_chat_provider_id=AsyncMock(return_value="provider"),
+            get_all_providers=Mock(return_value=[]),
             llm_generate=AsyncMock(return_value=SimpleNamespace(completion_text=completion())),
             send_message=AsyncMock(return_value=True),
         )
@@ -291,6 +292,30 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(is_ai)
         importer.validate_ics(result)
         self.assertEqual(self.context.llm_generate.await_args.kwargs["image_urls"], [str(p)])
+
+    async def test_selected_import_provider_is_used(self):
+        p = self.root / "course.json"
+        p.write_text('{"course":"Math"}', encoding="utf-8")
+        self.bot._plugin_config = {"import_provider_id": "chosen"}
+        self.context.get_all_providers.return_value = [SimpleNamespace(meta=lambda: SimpleNamespace(id="chosen"))]
+        await self.bot._extract_schedule(event(), ComponentFile("course.json", p), "")
+        self.assertEqual(self.context.llm_generate.await_args.kwargs["chat_provider_id"], "chosen")
+        self.context.get_current_chat_provider_id.assert_not_awaited()
+
+    async def test_missing_selected_provider_fails_without_fallback(self):
+        p = self.root / "course.json"
+        p.write_text('{"course":"Math"}', encoding="utf-8")
+        self.bot._plugin_config = {"import_provider_id": "missing"}
+        with self.assertRaisesRegex(importer.ImportProblem, "当前不可用"):
+            await self.bot._extract_schedule(event(), ComponentFile("course.json", p), "")
+        self.context.llm_generate.assert_not_awaited()
+        self.context.get_current_chat_provider_id.assert_not_awaited()
+
+    def test_provider_schema_is_native_select(self):
+        schema = json.loads((Path(plugin.__file__).parent / "_conf_schema.json").read_text(encoding="utf-8"))
+        setting = schema["import_provider_id"]
+        self.assertEqual((setting["type"], setting["default"], setting["_special"]),
+                         ("string", "", "select_provider"))
 
     async def test_binding_waiter_only_imports_the_owners_attachment(self):
         p = self.root / "adapter.json"

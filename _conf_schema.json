@@ -1,0 +1,9 @@
+{
+  "import_provider_id": {
+    "type": "string",
+    "description": "课表解析模型",
+    "hint": "留空时跟随当前会话模型；用于课表附件和 /课表时间 图片识别，不影响普通对话或全局模型配置。图片需要支持视觉输入的模型。",
+    "_special": "select_provider",
+    "default": ""
+  }
+}
