@@ -94,9 +94,9 @@ DAY_TMPL = r"""
   <div class="container">
     <div class="header">
       <div class="title-group">
-        <h1>📅 {{ title }}</h1>
+        <h1>📅 {{ title | e }}</h1>
       </div>
-      <div class="date-badge">{{ subtitle.split(' | ')[1] }}</div>
+      <div class="date-badge">{{ subtitle.split(' | ')[1] | e }}</div>
     </div>
     <div class="course-stack">
       {% if courses|length == 0 %}
@@ -108,12 +108,12 @@ DAY_TMPL = r"""
         {% for c in courses %}
           <div class="course-card">
             <div class="time-slot">
-              <span class="time-start">{{ c.time_range.split(' - ')[0] }}</span>
-              <span class="time-end">{{ c.time_range.split(' - ')[1] }}</span>
+              <span class="time-start">{{ c.time_range.split(' - ')[0] | e }}</span>
+              <span class="time-end">{{ c.time_range.split(' - ')[1] | e }}</span>
             </div>
             <div class="course-info">
-              <div class="course-name">{{ c.summary }}</div>
-              <div class="meta-item">📍 {{ c.location if c.location else "待定地点" }}</div>
+              <div class="course-name">{{ c.summary | e }}</div>
+              <div class="meta-item">📍 {{ (c.location if c.location else "待定地点") | e }}</div>
             </div>
           </div>
         {% endfor %}
@@ -236,16 +236,16 @@ WEEK_TMPL = r"""
 <body>
   <div class="container">
     <div class="title-area">
-      <h1 class="title">{{ title }}</h1>
-      <p class="subtitle">{{ subtitle.split(' | ')[1] }}</p>
+      <h1 class="title">{{ title | e }}</h1>
+      <p class="subtitle">{{ subtitle.split(' | ')[1] | e }}</p>
     </div>
     
     <div class="grid">
       {% for day in days %}
         <div class="day-section {{ 'is-today' if day.is_today else '' }}">
           <div class="day-header">
-            <span class="day-name">{{ day.label }}{{ ' (今天)' if day.is_today else '' }}</span>
-            <span class="day-date">{{ day.date }}</span>
+            <span class="day-name">{{ day.label | e }}{{ ' (今天)' if day.is_today else '' }}</span>
+            <span class="day-date">{{ day.date | e }}</span>
           </div>
           <div class="course-list">
             {% if day.courses|length == 0 %}
@@ -253,9 +253,9 @@ WEEK_TMPL = r"""
             {% else %}
               {% for c in day.courses %}
                 <div class="course-row">
-                  <div class="c-time">{{ c.time_range }}</div>
-                  <div class="c-name">{{ c.summary }}</div>
-                  <div class="c-loc">📍 {{ c.location if c.location else "待定" }}</div>
+                  <div class="c-time">{{ c.time_range | e }}</div>
+                  <div class="c-name">{{ c.summary | e }}</div>
+                  <div class="c-loc">📍 {{ (c.location if c.location else "待定") | e }}</div>
                 </div>
               {% endfor %}
             {% endif %}

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, field
 from datetime import datetime
 
 
@@ -35,3 +35,5 @@ class UserBinding:
     daily_push_time: str = "07:00"  # Format: HH:MM
     reminder_advance_minutes: int = 15
     daily_push_job_id: str = ""
+    # Explicit overrides for each group conversation; the binding group defaults on.
+    group_reminders: dict[str, bool] = field(default_factory=dict)

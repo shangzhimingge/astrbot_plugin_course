@@ -3,22 +3,32 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime, timedelta
+from pathlib import Path
 from types import MappingProxyType
 from typing import Dict, Mapping, Optional, Set
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import Image
+from astrbot.api.message_components import File, Image
 from astrbot.api.star import Context, Star, register
 from astrbot.core.platform.message_session import MessageSession
-from astrbot.core.utils.io import download_file
-from astrbot.core.utils.session_waiter import SessionController, session_waiter
+from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
+from astrbot.core.utils.session_waiter import SessionController, SessionFilter, session_waiter
 
-from .course_types import CourseEvent
+from .course_types import CourseEvent, UserBinding
 from .ics_parser import IcsParser, SHANGHAI_TZ
 from .render_templates import DAY_TMPL, WEEK_PAGE_WIDTH, WEEK_TMPL
 from .schedule_engine import day_events, upcoming_within_15m, week_start
 from .storage import CourseStorage
+from .importer import (
+    MAX_BYTES,
+    SUPPORTED,
+    SYSTEM_PROMPT,
+    ImportProblem,
+    extract,
+    parse_model_result,
+    validate_ics,
+)
 
 
 # Every schedule uses content-sized full-page capture.  Keep the shared
@@ -56,6 +66,7 @@ class CoursePlugin(Star):
         self._stop_event = asyncio.Event()
         self._reminder_task: Optional[asyncio.Task[None]] = None
         self._initializing_lock = asyncio.Lock()
+        self._active_imports: Set[str] = set()
 
     async def initialize(self):
         # 使用锁防止并发初始化
@@ -124,71 +135,190 @@ class CoursePlugin(Star):
         
         logger.info("[course] reminder system terminated")
 
+    def _owned_binding(self, event: AstrMessageEvent) -> UserBinding | None:
+        user_id = event.get_sender_id()
+        binding = self._storage.get_binding(user_id) if user_id else None
+        platform = event.get_platform_id()
+        if binding and platform and _session_parts(binding.unified_msg_origin)[0] == platform:
+            return binding
+        return None
+
     @filter.command("绑定课表")
     async def bind(self, event: AstrMessageEvent):
-        user_id = str(event.get_sender_id())
-        nickname = str(event.get_sender_name())
-
-        yield event.plain_result(
-            "请在 120 秒内发送 .ics 文件。\n"
-            "发送\"退出\"可取消。"
-        )
-
-        @session_waiter(timeout=120, record_history_chains=False)
-        async def waiter(controller: SessionController, evt: AstrMessageEvent):
-            text = (evt.message_str or "").strip()
-            if text == "退出":
-                await evt.send(evt.plain_result("已取消绑定。"))
-                controller.stop()
-                return
-
-            ics_path = self._storage.get_ics_path(user_id)
-
-            file_url = await _try_get_file_url(evt)
-            if file_url:
-                await evt.send(evt.plain_result("正在下载课表..."))
-                try:
-                    await download_file(file_url, str(ics_path))
-                    self._parser.clear_cache(str(ics_path))
-                    self._storage.upsert_binding(
-                        user_id=user_id,
-                        unified_msg_origin=evt.unified_msg_origin,
-                        nickname=nickname,
-                    )
-                    await evt.send(evt.plain_result("绑定成功。"))
-                    controller.stop()
-                except Exception as e:
-                    logger.error(f"[course] download ics failed: {e}")
-                    await evt.send(evt.plain_result("文件下载失败，请重试。"))
-                    controller.stop()
-                return
-
-            controller.keep(timeout=120, reset_timeout=True)
-
+        user_id = event.get_sender_id()
+        origin = event.unified_msg_origin
+        if not user_id or _session_parts(origin)[0] != event.get_platform_id():
+            yield event.plain_result("当前会话缺少可识别的账号或平台信息。")
+            return
+        existing = self._storage.get_binding(user_id)
+        if existing and not self._owned_binding(event):
+            yield event.plain_result("请在原绑定的机器人会话中管理课表。")
+            return
+        if user_id in self._active_imports:
+            yield event.plain_result("你已有进行中的绑定，请稍后重试。")
+            return
+        self._active_imports.add(user_id)
+        calendar_hint = ""
         try:
-            await waiter(event)
+            yield event.plain_result(
+                "请在 120 秒内发送一份课表文件或图片：ICS、Excel、Word (.docx)、PDF、JSON、HTML、PNG/JPG/WEBP。\n"
+                "非 ICS 内容会交给当前会话的模型识别。若课表只有周次，可先发「课表补充 第一周周一 YYYY-MM-DD」；"
+                "只有节次时还需注明实际作息时间。发送「退出」取消。"
+            )
+
+            @session_waiter(timeout=120, record_history_chains=False)
+            async def waiter(controller: SessionController, evt: AstrMessageEvent):
+                nonlocal calendar_hint
+                if evt.get_sender_id() != user_id or evt.unified_msg_origin != origin:
+                    return
+                caption = (evt.message_str or "").strip()
+                if caption == "退出":
+                    controller.stop()
+                    await evt.send(evt.plain_result("已取消绑定。"))
+                    return
+                attachments = [part for part in evt.get_messages() if isinstance(part, (File, Image))]
+                if not attachments:
+                    if caption.startswith("课表补充 "):
+                        calendar_hint = caption.removeprefix("课表补充 ").strip()[:800]
+                        await evt.send(evt.plain_result("已记录本次导入的日期或作息补充，请发送附件。"))
+                    return
+                if len(attachments) != 1:
+                    await evt.send(evt.plain_result("请每次发送一份附件或一张课表图片。"))
+                    return
+                controller.keep(timeout=95, reset_timeout=True)
+                try:
+                    async with asyncio.timeout(90):
+                        content = await self._extract_schedule(
+                            evt, attachments[0], "\n".join([value for value in (calendar_hint, caption) if value])
+                        )
+                    if controller.future.done():
+                        return
+                    binding = self._storage.store_calendar(
+                        user_id=user_id, origin=origin, nickname=event.get_sender_name(), content=content
+                    )
+                    if existing:
+                        self._parser.clear_cache(str((self._storage._base_dir / existing.ics_file).resolve()))
+                except ImportProblem as exc:
+                    message = str(exc)
+                except TimeoutError:
+                    message = "下载或识别超时，请重试。"
+                except Exception as exc:
+                    logger.warning(f"[course] import failed ({type(exc).__name__})")
+                    message = "读取或识别失败。请检查附件格式和当前会话的模型配置。"
+                else:
+                    controller.stop()
+                    tip = ("本群课前提醒已开启。" if origin in _reminder_targets(binding) and evt.get_group_id()
+                           else "本次没有为当前群自动开启课前提醒。")
+                    await evt.send(evt.plain_result(
+                        f"课表绑定成功。{tip}在其他群可直接查同一份课表；需要提醒时发送 /开启群提醒。"
+                    ))
+                    return
+                if not controller.future.done():
+                    controller.keep(timeout=120, reset_timeout=True)
+                    await evt.send(evt.plain_result(f"{message} 原课表保留，可重新发送或回复「退出」。"))
+
+            await waiter(event, session_filter=_OwnerSessionFilter("import"))
         except TimeoutError:
             yield event.plain_result("绑定超时。")
         finally:
+            self._active_imports.discard(user_id)
             event.stop_event()
+
+    async def _extract_schedule(self, event, attachment: File | Image, caption: str) -> bytes:
+        cleanup_prefix = None
+        if isinstance(attachment, File):
+            name = attachment.name or ""
+            if any(char in "/\\:" or ord(char) < 32 for char in name):
+                raise ImportProblem("附件文件名无效。")
+            suffix = Path(name).suffix.lower()
+            if suffix not in SUPPORTED:
+                raise ImportProblem("暂不支持该文件格式；Word 请发送 .docx。")
+            previous_path = getattr(attachment, "file_", None)
+            path = await attachment.get_file()
+            if getattr(attachment, "file_", None) != previous_path:
+                cleanup_prefix = "fileseg_"
+        else:
+            suffix = ".jpg"  # The extractor checks the actual image format.
+            source = attachment.url or attachment.file or ""
+            if source.startswith("base64://") and len(source) > 9 + ((MAX_BYTES + 2) // 3) * 4:
+                raise ImportProblem("图片超过 12 MiB。")
+            path = await attachment.convert_to_file_path()
+            if source.startswith(("http://", "https://")):
+                cleanup_prefix = "io_temp_img_"
+            elif source.startswith("base64://"):
+                cleanup_prefix = "imgseg_"
+        try:
+            kind, content = await asyncio.to_thread(extract, path, suffix)
+            if kind == "ics":
+                data = content.encode("utf-8")
+                await asyncio.to_thread(validate_ics, data)
+                return data
+            prompt = json.dumps(
+                {"日历补充信息": caption[:800], "附件可读数据": content if kind == "text" else ""},
+                ensure_ascii=False,
+            )
+            provider = await self._context.get_current_chat_provider_id(event.unified_msg_origin)
+            response = await self._context.llm_generate(
+                chat_provider_id=provider, prompt=prompt, system_prompt=SYSTEM_PROMPT,
+                image_urls=[content] if kind == "image" else None,
+            )
+            return await asyncio.to_thread(parse_model_result, response.completion_text, SHANGHAI_TZ)
+        finally:
+            if cleanup_prefix and path:
+                downloaded = Path(path)
+                try:
+                    if (
+                        downloaded.name.startswith(cleanup_prefix)
+                        and not downloaded.is_symlink()
+                        and downloaded.resolve().parent == Path(get_astrbot_temp_path()).resolve()
+                    ):
+                        downloaded.unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.warning(f"[course] attachment cleanup failed ({type(exc).__name__})")
 
     @filter.command("删除课表")
     async def delete(self, event: AstrMessageEvent):
-        user_id = str(event.get_sender_id())
-
-        await self._unregister_user_cron(user_id)
-
-        ok = self._storage.delete_binding(user_id)
-        self._reminded.pop(user_id, None)
-        if ok:
-            yield event.plain_result("已删除课表。")
-        else:
+        binding = self._owned_binding(event)
+        if not binding:
             yield event.plain_result("你还没有绑定课表。")
+            return
+        user_id = binding.user_id
+        if user_id in self._active_imports:
+            yield event.plain_result("请先结束正在进行的绑定，再删除课表。")
+            return
+        self._active_imports.add(user_id)
+        try:
+            await self._unregister_user_cron(user_id)
+            if self._storage.delete_binding(user_id):
+                self._reminded.pop(user_id, None)
+                self._parser.clear_cache(str((self._storage._base_dir / binding.ics_file).resolve()))
+                yield event.plain_result("已删除课表。")
+        finally:
+            self._active_imports.discard(user_id)
+
+    @filter.command("开启群提醒")
+    async def enable_group_reminders(self, event: AstrMessageEvent):
+        yield event.plain_result(self._set_group_reminders(event, True))
+
+    @filter.command("关闭群提醒")
+    async def disable_group_reminders(self, event: AstrMessageEvent):
+        yield event.plain_result(self._set_group_reminders(event, False))
+
+    def _set_group_reminders(self, event: AstrMessageEvent, enabled: bool) -> str:
+        origin = event.unified_msg_origin
+        if not event.get_group_id() or _session_parts(origin)[1] != "GroupMessage":
+            return "该命令仅在群聊中生效。"
+        binding = self._owned_binding(event)
+        if not binding:
+            return "请先使用 /绑定课表。"
+        if not self._storage.set_group_reminder(binding.user_id, origin, enabled):
+            return "请先使用 /绑定课表。"
+        return "已开启本群课前提醒。" if enabled else "已关闭本群课前提醒。"
 
     @filter.command("设置每日推送")
     async def set_daily_push(self, event: AstrMessageEvent):
         user_id = str(event.get_sender_id())
-        binding = self._storage.get_binding(user_id)
+        binding = self._owned_binding(event)
         if not binding:
             yield event.plain_result("你还没有绑定课表。请先使用 /绑定课表")
             return
@@ -243,7 +373,7 @@ class CoursePlugin(Star):
             controller.keep(timeout=120, reset_timeout=True)
 
         try:
-            await waiter(event)
+            await waiter(event, session_filter=_OwnerSessionFilter("daily-push"))
         except TimeoutError:
             yield event.plain_result("设置超时。")
         finally:
@@ -252,7 +382,7 @@ class CoursePlugin(Star):
     @filter.command("设置提醒时间")
     async def set_reminder_time(self, event: AstrMessageEvent):
         user_id = str(event.get_sender_id())
-        binding = self._storage.get_binding(user_id)
+        binding = self._owned_binding(event)
         if not binding:
             yield event.plain_result("你还没有绑定课表。请先使用 /绑定课表")
             return
@@ -286,7 +416,7 @@ class CoursePlugin(Star):
                 controller.keep(timeout=120, reset_timeout=True)
 
         try:
-            await waiter(event)
+            await waiter(event, session_filter=_OwnerSessionFilter("reminder-time"))
         except TimeoutError:
             yield event.plain_result("设置超时。")
         finally:
@@ -295,17 +425,21 @@ class CoursePlugin(Star):
     @filter.command("查看设置")
     async def view_settings(self, event: AstrMessageEvent):
         user_id = str(event.get_sender_id())
-        binding = self._storage.get_binding(user_id)
+        binding = self._owned_binding(event)
         if not binding:
             yield event.plain_result("你还没有绑定课表。请先使用 /绑定课表")
             return
 
         push_status = "已开启" if binding.enable_daily_push else "已关闭"
+        group_status = "仅在群聊中设置"
+        if event.get_group_id():
+            group_status = "已开启" if event.unified_msg_origin in _reminder_targets(binding) else "已关闭"
         settings_text = (
             f"当前设置：\n"
             f"每日推送：{push_status}\n"
             f"推送时间：{binding.daily_push_time}\n"
-            f"提前提醒：{binding.reminder_advance_minutes} 分钟"
+            f"提前提醒：{binding.reminder_advance_minutes} 分钟\n"
+            f"本群课前提醒：{group_status}"
         )
         yield event.plain_result(settings_text)
 
@@ -322,7 +456,7 @@ class CoursePlugin(Star):
     @filter.command("本周课表")
     async def week(self, event: AstrMessageEvent):
         user_id = str(event.get_sender_id())
-        binding = self._storage.get_binding(user_id)
+        binding = self._owned_binding(event)
         if not binding:
             yield event.plain_result("你还没有绑定课表。请先使用 /绑定课表")
             return
@@ -364,7 +498,7 @@ class CoursePlugin(Star):
     @filter.command("下周课表")
     async def next_week(self, event: AstrMessageEvent):
         user_id = str(event.get_sender_id())
-        binding = self._storage.get_binding(user_id)
+        binding = self._owned_binding(event)
         if not binding:
             yield event.plain_result("你还没有绑定课表。请先使用 /绑定课表")
             return
@@ -405,7 +539,7 @@ class CoursePlugin(Star):
 
     async def _send_day_schedule(self, event: AstrMessageEvent, *, day_offset: int):
         user_id = str(event.get_sender_id())
-        binding = self._storage.get_binding(user_id)
+        binding = self._owned_binding(event)
         if not binding:
             yield event.plain_result("你还没有绑定课表。请先使用 /绑定课表")
             return
@@ -577,14 +711,17 @@ class CoursePlugin(Star):
 
                 reminded = self._reminded.setdefault(user_id, set())
                 for hit in hits:
-                    key = hit.event.reminder_key()
-                    if key in reminded:
-                        continue
-                    reminded.add(key)
-                    msg = _reminder_text(hit.event, binding.reminder_advance_minutes)
-                    chain = MessageChain().message(msg)
-                    session = MessageSession.from_str(binding.unified_msg_origin)
-                    await self._context.send_message(session, chain)
+                    for origin in _reminder_targets(binding):
+                        key = f"{hit.event.reminder_key()}|{origin}"
+                        if key in reminded:
+                            continue
+                        try:
+                            message = _reminder_text(hit.event, binding.reminder_advance_minutes)
+                            chain = MessageChain().message(message)
+                            if await self._context.send_message(MessageSession.from_str(origin), chain):
+                                reminded.add(key)
+                        except Exception as exc:
+                            logger.warning(f"[course] reminder destination failed ({type(exc).__name__})")
             except Exception as e:
                 logger.error(f"[course] reminder failed for user {user_id}: {e}")
 
@@ -663,26 +800,36 @@ def _reminder_start_from_key(key: str) -> Optional[datetime]:
     return dt.astimezone(SHANGHAI_TZ)
 
 
-async def _try_get_file_url(event: AstrMessageEvent) -> Optional[str]:
-    try:
-        messages = event.get_messages()
-        for m in messages:
-            if hasattr(m, "type") and getattr(m, "type") == "File":
-                get_file = getattr(m, "get_file", None)
-                if not callable(get_file):
-                    continue
-                file_path_obj = get_file(allow_return_url=True)
-                if not asyncio.iscoroutine(file_path_obj):
-                    continue
-                file_path = await file_path_obj
-                if isinstance(file_path, str) and file_path.startswith("http"):
-                    return file_path
-        return None
-    except Exception:
-        return None
-
-
 def _is_valid_time_format(time_str: str) -> bool:
     import re
 
     return bool(re.match(r"^([0-1][0-9]|2[0-3]):[0-5][0-9]$", time_str))
+
+def _session_parts(origin: str) -> tuple[str, str]:
+    parts = origin.split(":", 2)
+    return (parts[0], parts[1]) if len(parts) == 3 and all(parts) else ("", "")
+
+
+def _reminder_targets(binding: UserBinding) -> tuple[str, ...]:
+    primary = binding.unified_msg_origin
+    platform, kind = _session_parts(primary)
+    if not platform:
+        return ()
+    destinations = {
+        origin for origin, enabled in binding.group_reminders.items()
+        if enabled is True and _session_parts(origin) == (platform, "GroupMessage")
+    }
+    if kind == "FriendMessage" or (
+        kind == "GroupMessage" and binding.group_reminders.get(primary, True) is True
+    ):
+        destinations.add(primary)
+    return tuple(sorted(destinations))
+
+
+class _OwnerSessionFilter(SessionFilter):
+    def __init__(self, purpose: str):
+        self.purpose = purpose
+
+    def filter(self, event: AstrMessageEvent) -> str:
+        key = json.dumps([event.unified_msg_origin, event.get_sender_id()], ensure_ascii=False)
+        return f"course:{self.purpose}:{key}"

@@ -1,2 +1,8 @@
 icalendar
 python-dateutil
+openpyxl
+xlrd
+python-docx
+pypdf>=6.17.0
+Pillow
+defusedxml
