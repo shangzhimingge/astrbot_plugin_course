@@ -266,6 +266,80 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("tools", request)
         self.assertIsNone(request["image_urls"])
 
+    async def test_ai_progress_is_sent_before_schedule_model_call_but_not_for_ics(self):
+        p = self.root / "course.json"
+        p.write_text('{"course":"Math"}', encoding="utf-8")
+        send = AsyncMock()
+        tracked = SimpleNamespace(
+            **vars(event()), send=send, plain_result=str,
+        )
+        original = self.context.llm_generate.side_effect
+
+        async def model(**kwargs):
+            send.assert_awaited_once()
+            return SimpleNamespace(completion_text=completion())
+
+        self.context.llm_generate.side_effect = model
+        await self.bot._extract_schedule(tracked, ComponentFile("course.json", p), "")
+        self.assertIn("AI 正在解析", send.await_args.args[0])
+        self.context.llm_generate.side_effect = original
+        self.context.llm_generate.reset_mock()
+        p.write_bytes(importer.parse_model_result(completion(), plugin.SHANGHAI_TZ))
+        await self.bot._extract_schedule(tracked, ComponentFile("course.ics", p), "")
+        send.assert_awaited_once()
+        self.context.llm_generate.assert_not_awaited()
+
+    async def test_nonstandard_period_json_and_text_use_ai(self):
+        send = AsyncMock()
+        tracked = SimpleNamespace(**vars(event()), send=send, plain_result=str)
+
+        async def model(**kwargs):
+            send.assert_awaited_once()
+            return SimpleNamespace(completion_text='{"1":["08:00","08:45"]}')
+
+        for filename, text in (
+            ("period.json", '{"slots":[{"lesson":1,"clock":"08:00-08:45"}]}'),
+            ("period.json", '{"1":{"start":"08:25","end":"09:10"}}'),
+            ("period.txt", "上午一节课 08:00 - 08:45"),
+        ):
+            path = self.root / filename
+            path.write_text(text, encoding="utf-8")
+            self.context.llm_generate.reset_mock()
+            send.reset_mock()
+            self.context.llm_generate.side_effect = model
+            result = await self.bot._extract_period_times(tracked, ComponentFile(filename, path))
+            self.assertEqual(result, {1: ("08:00", "08:45")})
+            self.assertIn(text, self.context.llm_generate.await_args.kwargs["prompt"])
+            self.assertIn("AI 正在解析", send.await_args.args[0])
+
+    def test_missing_period_time_is_typed_after_model_row_validation(self):
+        row = json.loads(completion())["courses"][0]
+        row.update(first_period=2, last_period=3, start=None, end="10:00")
+        raw = json.dumps({"courses": [row]})
+        with self.assertRaises(importer.NeedsPeriodTimes) as caught:
+            importer.parse_model_result(raw, plugin.SHANGHAI_TZ)
+        self.assertEqual(caught.exception.periods, {2, 3})
+        self.assertEqual(caught.exception.response, raw)
+        self.assertEqual(
+            Calendar.from_ical(importer.parse_model_result(
+                raw, plugin.SHANGHAI_TZ,
+                {2: ("09:15", "10:00"), 3: ("10:15", "11:00")},
+            )).walk("VEVENT")[0].decoded("dtend").astimezone(plugin.SHANGHAI_TZ).strftime("%H:%M"),
+            "10:00",
+        )
+        invalid = dict(row, summary="")
+        with self.assertRaisesRegex(importer.ImportProblem, "名称或地点"):
+            importer.parse_model_result(json.dumps({"courses": [invalid]}), plugin.SHANGHAI_TZ)
+
+        weekly = dict(row, weekday=3, weeks=[1, 2])
+        del weekly["date"]
+        with self.assertRaises(importer.NeedsPeriodTimes) as recurring:
+            importer.parse_model_result(
+                json.dumps({"first_week_monday": "2026-08-31", "courses": [weekly]}),
+                plugin.SHANGHAI_TZ,
+            )
+        self.assertEqual(recurring.exception.week_anchor, date(2026, 8, 31))
+
     async def test_downloaded_file_cleanup_respects_original_files(self):
         p = self.root / "fileseg_course_123.json"
         p.write_text("{}", encoding="utf-8")
@@ -394,7 +468,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             future=SimpleNamespace(done=Mock(return_value=False)), stop=Mock(), keep=Mock(),
         )
 
-        async def late_result(*args):
+        async def late_result(*args, **kwargs):
             controller.future.done.return_value = True
             return old_data, True
 
@@ -415,6 +489,112 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         store.assert_not_called()
         send.assert_not_awaited()
         controller.stop.assert_not_called()
+        self.assertEqual(self.storage.get_binding("001").ics_file, old.ics_file)
+        self.assertEqual((self.root / old.ics_file).read_bytes(), old_data)
+
+    async def test_missing_times_are_completed_in_same_binding_without_resending_course(self):
+        old = self.store()
+        old_data = (self.root / old.ics_file).read_bytes()
+        row = json.loads(completion())["courses"][0]
+        row.update(first_period=1, last_period=1, start=None, end=None)
+        second = dict(row, summary="另一门课", first_period=2, last_period=2)
+        raw = json.dumps({"courses": [row, second]}, ensure_ascii=False)
+        course_path = self.root / "course.json"
+        course_path.write_text('{"schedule":"attached"}', encoding="utf-8")
+        course_file = ComponentFile("course.json", course_path)
+        partial_path = self.root / "partial.txt"
+        partial_path.write_text("第1节 08:25-09:10", encoding="utf-8")
+        full_path = self.root / "complete.txt"
+        full_path.write_text("第1节 08:25-09:10\n第2节 09:15-10:00", encoding="utf-8")
+        partial_file = ComponentFile("partial.txt", partial_path)
+        full_file = ComponentFile("complete.txt", full_path)
+        send = AsyncMock()
+
+        def message(text="", parts=()):
+            return SimpleNamespace(
+                **vars(event()), message_str=text, get_messages=lambda: parts,
+                plain_result=str, send=send, get_sender_name=lambda: "同学", stop_event=Mock(),
+            )
+
+        controller = SimpleNamespace(
+            future=SimpleNamespace(done=Mock(return_value=False)), stop=Mock(), keep=Mock(),
+        )
+
+        def fake_waiter(**kwargs):
+            def decorate(callback):
+                async def run(starter, session_filter):
+                    await callback(controller, message(parts=[course_file]))
+                    self.assertEqual(self.storage.get_binding("001").ics_file, old.ics_file)
+                    self.assertEqual((self.root / old.ics_file).read_bytes(), old_data)
+                    await callback(controller, message(text="not a timetable"))
+                    self.assertEqual(self.storage.get_binding("001").ics_file, old.ics_file)
+                    await callback(controller, message(parts=[partial_file]))
+                    self.assertEqual(self.storage.get_binding("001").ics_file, old.ics_file)
+                    await callback(controller, message(parts=[full_file]))
+                return run
+            return decorate
+
+        self.context.llm_generate.return_value = SimpleNamespace(completion_text=raw)
+        self.context.llm_generate.reset_mock()
+        with patch.object(plugin, "session_waiter", fake_waiter), patch.object(
+            self.storage, "store_calendar", wraps=self.storage.store_calendar
+        ) as store:
+            replies = [item async for item in self.bot.bind(message())]
+        self.assertTrue(replies)
+        self.context.llm_generate.assert_awaited_once()
+        store.assert_called_once()
+        self.assertEqual(self.storage.get_period_times(BIND, "001"), {})
+        self.assertNotEqual(self.storage.get_binding("001").ics_file, old.ics_file)
+        guidance = " ".join(call.args[0] for call in send.await_args_list)
+        self.assertIn("无需重发课表", guidance)
+        self.assertIn("第 1, 2 节", guidance)
+        self.assertEqual(len(Calendar.from_ical(
+            (self.root / self.storage.get_binding("001").ics_file).read_bytes()
+        ).walk("VEVENT")), 2)
+
+    async def test_expired_period_followup_does_not_replace_calendar(self):
+        old = self.store()
+        old_data = (self.root / old.ics_file).read_bytes()
+        row = json.loads(completion())["courses"][0]
+        row.update(first_period=1, last_period=1, start=None, end=None)
+        response = json.dumps({"courses": [row]}, ensure_ascii=False)
+        course_path = self.root / "course.json"
+        course_path.write_text('{"schedule":"attached"}', encoding="utf-8")
+        course_file = ComponentFile("course.json", course_path)
+        period_path = self.root / "period.txt"
+        period_path.write_text("第1节 08:25-09:10", encoding="utf-8")
+        period_file = ComponentFile("period.txt", period_path)
+        send = AsyncMock()
+
+        def message(parts=()):
+            return SimpleNamespace(
+                **vars(event()), message_str="", get_messages=lambda: parts,
+                plain_result=str, send=send, get_sender_name=lambda: "同学", stop_event=Mock(),
+            )
+
+        future = SimpleNamespace(done=Mock(return_value=False))
+        controller = SimpleNamespace(future=future, stop=Mock(), keep=Mock())
+
+        def fake_waiter(**kwargs):
+            def decorate(callback):
+                async def run(starter, session_filter):
+                    await callback(controller, message([course_file]))
+                    future.done.return_value = True
+                    await callback(controller, message([period_file]))
+                return run
+            return decorate
+
+        self.context.llm_generate.return_value = SimpleNamespace(completion_text=response)
+        self.context.llm_generate.reset_mock()
+        with patch.object(plugin, "session_waiter", fake_waiter), patch.object(
+            self.storage, "store_calendar", wraps=self.storage.store_calendar,
+        ) as store:
+            replies = [item async for item in self.bot.bind(message())]
+        self.assertTrue(replies)
+        store.assert_not_called()
+        period_file.get_file.assert_not_awaited()
+        self.assertEqual(self.context.llm_generate.await_count, 1)
+        self.assertTrue(send.await_count)
         self.assertEqual(self.storage.get_binding("001").ics_file, old.ics_file)
         self.assertEqual((self.root / old.ics_file).read_bytes(), old_data)
 
