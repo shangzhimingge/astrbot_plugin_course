@@ -3,6 +3,6 @@ python-dateutil
 openpyxl
 xlrd
 python-docx
-pypdf>=6.17.0
+pypdfium2>=5.15.2,<6
 Pillow
 defusedxml

@@ -117,6 +117,36 @@ def completion(day=None):
     ]}, ensure_ascii=False)
 
 
+def make_pdf(pages):
+    """Write a tiny PDF text fixture without relying on the conflicting core pypdf."""
+    objects = [b"<< /Type /Catalog /Pages 2 0 R >>"]
+    kids = " ".join(f"{3 + i * 2} 0 R" for i in range(len(pages)))
+    objects.append(f"<< /Type /Pages /Kids [{kids}] /Count {len(pages)} >>".encode())
+    for i, text in enumerate(pages):
+        page_id = 3 + i * 2
+        stream_id = page_id + 1
+        content = b"" if text is None else (
+            b"BT /F1 12 Tf 20 350 Td (" + text.encode("ascii") + b") Tj ET"
+        )
+        objects.append(
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 400] "
+            f"/Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> "
+            f"/Contents {stream_id} 0 R >>".encode()
+        )
+        objects.append(f"<< /Length {len(content)} >>\nstream\n".encode() + content + b"\nendstream")
+    data = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for i, obj in enumerate(objects, 1):
+        offsets.append(len(data))
+        data += f"{i} 0 obj\n".encode() + obj + b"\nendobj\n"
+    xref = len(data)
+    data += f"xref\n0 {len(offsets)}\n0000000000 65535 f \n".encode()
+    for offset in offsets[1:]:
+        data += f"{offset:010d} 00000 n \n".encode()
+    data += f"trailer\n<< /Size {len(offsets)} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF".encode()
+    return bytes(data)
+
+
 class Files(unittest.TestCase):
     def setUp(self):
         self.workspace = tempfile.TemporaryDirectory()
@@ -126,8 +156,6 @@ class Files(unittest.TestCase):
     def test_text_formats_and_preserve_layout(self):
         from docx import Document
         from openpyxl import Workbook
-        from pypdf import PdfWriter
-        from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
         p = self.root / "schedule.json"
         p.write_text('{"name":"程序设计"}', encoding="utf-8")
@@ -157,22 +185,23 @@ class Files(unittest.TestCase):
         self.assertIn("Term 2026\n | Math", importer.extract(p)[1])
 
         p = self.root / "schedule.pdf"
-        writer = PdfWriter()
-        page = writer.add_blank_page(400, 400)
-        font = DictionaryObject({
-            NameObject("/Type"): NameObject("/Font"),
-            NameObject("/Subtype"): NameObject("/Type1"),
-            NameObject("/BaseFont"): NameObject("/Helvetica"),
-        })
-        page[NameObject("/Resources")] = DictionaryObject({
-            NameObject("/Font"): DictionaryObject({NameObject("/F1"): font}),
-        })
-        stream = DecodedStreamObject()
-        stream.set_data(b"BT /F1 12 Tf 20 200 Td (Math Mon 08:00) Tj ET")
-        page[NameObject("/Contents")] = writer._add_object(stream)
-        with p.open("wb") as binary:
-            writer.write(binary)
+        p.write_bytes(make_pdf(["Math Mon 08:00"]))
         self.assertIn("Math Mon 08:00", importer.extract(p)[1])
+
+    def test_pdf_blank_malformed_page_limit_and_text_limit(self):
+        p = self.root / "schedule.pdf"
+        p.write_bytes(make_pdf([None]))
+        with self.assertRaisesRegex(importer.ImportProblem, "未找到可读取"):
+            importer.extract(p)
+        p.write_bytes(b"not a pdf")
+        with self.assertRaises(importer.ImportProblem):
+            importer.extract(p)
+        p.write_bytes(make_pdf([None] * 51))
+        with self.assertRaisesRegex(importer.ImportProblem, "页数过多"):
+            importer.extract(p)
+        p.write_bytes(make_pdf(["Math", "ABCD"]))
+        with patch.object(importer, "MAX_TEXT", 9), self.assertRaisesRegex(importer.ImportProblem, "文字过多"):
+            importer.extract(p)
 
     def test_image_type_size_and_unsupported(self):
         from PIL import Image
