@@ -36,7 +36,7 @@ from .importer import (
     parse_model_result,
     validate_ics,
 )
-from .period_times import MAX_INPUT, parse_period_times
+from .period_times import MAX_INPUT, is_app_timetable, parse_period_times
 
 
 # Every schedule uses content-sized full-page capture.  Keep the shared
@@ -433,7 +433,7 @@ class CoursePlugin(Star):
                     raw = raw_bytes.decode("utf-8-sig")
                     # Keep recognizable period-table input strict, while
                     # sending nonstandard layouts to AI for contextual reading.
-                    if ((suffix == ".json" and _looks_like_period_json(raw))
+                    if (_looks_like_period_json(raw)
                             or (suffix == ".txt" and _looks_like_period_text(raw))):
                         raise
                     kind, content = "text", raw[:MAX_INPUT]
@@ -498,7 +498,7 @@ class CoursePlugin(Star):
         self._active_imports.add(user_id)
         try:
             yield event.plain_result(
-                '请在 120 秒内发送作息 JSON（如 {"1":["08:25","09:10"]}）、'
+                '请在 120 秒内发送作息 JSON（支持教务 App 作息导出 JSON）、'
                 '文本（每行一节，如「第1节 08:25-09:10」），或发送 .json / .txt 文件、作息表图片。'
                 '新表将替换旧表；发送「退出」取消。'
             )
@@ -1123,10 +1123,16 @@ def _read_bounded(path: str, limit: int) -> bytes:
 
 
 def _looks_like_period_json(raw: str) -> bool:
+    raw = raw.strip().lstrip("\ufeff").strip()
+    fenced = re.fullmatch(r"\x60\x60\x60(?:json)?\s*([\s\S]+?)\s*\x60\x60\x60", raw, re.I)
+    if fenced:
+        raw = fenced[1].strip()
     try:
         value = json.loads(raw)
     except (ValueError, RecursionError):
         return False
+    if is_app_timetable(value):
+        return True
     if isinstance(value, dict) and set(value) == {"periods"}:
         value = value["periods"]
     if isinstance(value, dict):

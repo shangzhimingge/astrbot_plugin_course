@@ -16,6 +16,11 @@ _TEXT_ROW = re.compile(
 )
 
 
+def is_app_timetable(value: object) -> bool:
+    """Return whether a decoded JSON object uses the supported timetable export envelope."""
+    return isinstance(value, dict) and value.get("type") == "timetable"
+
+
 def _object_pairs(pairs):
     result = {}
     for key, value in pairs:
@@ -49,6 +54,39 @@ def _input_rows(source: str, *, json_only: bool):
     return rows
 
 
+def _rows_from_app_timetable(value: dict) -> list[dict]:
+    """Convert the timetable export's clock fields to the canonical row shape."""
+    data = value.get("data")
+    if not isinstance(data, dict):
+        raise ImportProblem("作息 JSON 缺少有效的 data 对象。")
+    rows = data.get("items")
+    special = data.get("specialPeriods")
+    if special is not None and special != []:
+        raise ImportProblem("当前仅支持常规作息节次；请先移除特别节次后导出。")
+    if not isinstance(rows, list) or not 1 <= len(rows) <= MAX_PERIOD:
+        raise ImportProblem("作息 JSON 的 items 数量无效。")
+
+    converted = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ImportProblem("作息 JSON 的 items 项格式无效。")
+        values = (row.get("section"), row.get("startHour"), row.get("startMinute"),
+                  row.get("endHour"), row.get("endMinute"))
+        if any(type(item) is not int for item in values):
+            raise ImportProblem("作息 JSON 的节次和时刻必须为整数。")
+        section, start_hour, start_minute, end_hour, end_minute = values
+        if not 0 <= start_hour <= 23 or not 0 <= end_hour <= 23:
+            raise ImportProblem("作息 JSON 含有无效小时。")
+        if not 0 <= start_minute <= 59 or not 0 <= end_minute <= 59:
+            raise ImportProblem("作息 JSON 含有无效分钟。")
+        converted.append({
+            "period": section,
+            "start": f"{start_hour:02d}:{start_minute:02d}",
+            "end": f"{end_hour:02d}:{end_minute:02d}",
+        })
+    return converted
+
+
 def parse_period_times(
     source: str | bytes | dict | list, *, json_only: bool = False,
 ) -> dict[int, tuple[str, str]]:
@@ -63,6 +101,8 @@ def parse_period_times(
         value = _input_rows(source, json_only=json_only)
     else:
         value = source
+    if is_app_timetable(value):
+        value = _rows_from_app_timetable(value)
     if isinstance(value, dict) and set(value) == {"periods"}:
         value = value["periods"]
 

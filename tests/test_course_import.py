@@ -93,6 +93,33 @@ def load_plugin():
     return plugin, imported, storage
 
 
+def app_timetable_export():
+    periods = (
+        (8, 25, 9, 10), (9, 15, 10, 0), (10, 15, 11, 0), (11, 5, 11, 50),
+        (13, 40, 14, 25), (14, 30, 15, 15), (15, 30, 16, 15), (16, 20, 17, 5),
+        (17, 10, 17, 55), (18, 45, 19, 30), (19, 35, 20, 20), (20, 25, 21, 10),
+    )
+    return {
+        "type": "timetable",
+        "version": "1.0",
+        "exportTime": "2026-11-20T21:02:37",
+        "data": {
+            "name": "教学作息时间",
+            "classDuration": 45,
+            "breakDuration": 5,
+            "items": [
+                {
+                    "section": index,
+                    "startHour": values[0], "startMinute": values[1],
+                    "endHour": values[2], "endMinute": values[3],
+                }
+                for index, values in enumerate(periods, start=1)
+            ],
+            "specialPeriods": [],
+        },
+    }
+
+
 plugin, importer, storage_module = load_plugin()
 BIND = "bot:GroupMessage:100"
 OTHER = "bot:GroupMessage:200"
@@ -505,7 +532,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         partial_path = self.root / "partial.txt"
         partial_path.write_text("第1节 08:25-09:10", encoding="utf-8")
         full_path = self.root / "complete.txt"
-        full_path.write_text("第1节 08:25-09:10\n第2节 09:15-10:00", encoding="utf-8")
+        full_path.write_text(json.dumps(app_timetable_export(), ensure_ascii=False), encoding="utf-8")
         partial_file = ComponentFile("partial.txt", partial_path)
         full_file = ComponentFile("complete.txt", full_path)
         send = AsyncMock()
@@ -548,9 +575,20 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         guidance = " ".join(call.args[0] for call in send.await_args_list)
         self.assertIn("无需重发课表", guidance)
         self.assertIn("第 1, 2 节", guidance)
-        self.assertEqual(len(Calendar.from_ical(
+        courses = Calendar.from_ical(
             (self.root / self.storage.get_binding("001").ics_file).read_bytes()
-        ).walk("VEVENT")), 2)
+        ).walk("VEVENT")
+        self.assertEqual(len(courses), 2)
+        by_name = {
+            str(course.get("summary")): (
+                course.decoded("dtstart").astimezone(plugin.SHANGHAI_TZ).strftime("%H:%M"),
+                course.decoded("dtend").astimezone(plugin.SHANGHAI_TZ).strftime("%H:%M"),
+            )
+            for course in courses
+        }
+        self.assertEqual(by_name["程序设计"], ("08:25", "09:10"))
+        self.assertEqual(by_name["另一门课"], ("09:15", "10:00"))
+        self.assertEqual(self.context.llm_generate.await_count, 1)
 
     async def test_expired_period_followup_does_not_replace_calendar(self):
         old = self.store()
@@ -800,6 +838,91 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             await self.bot._extract_period_times(event(), ComponentFile("period.txt", path)),
             {1: ("08:25", "09:10")},
         )
+        self.context.llm_generate.assert_not_awaited()
+
+    async def test_app_timetable_export_parses_without_ai_for_paste_followup_and_file(self):
+        exported = app_timetable_export()
+        raw = json.dumps(exported, ensure_ascii=False)
+        expected = {
+            index: (f"{row['startHour']:02}:{row['startMinute']:02}",
+                    f"{row['endHour']:02}:{row['endMinute']:02}")
+            for index, row in enumerate(exported["data"]["items"], start=1)
+        }
+        self.assertEqual(plugin.parse_period_times(raw), expected)
+        self.assertTrue(plugin._looks_like_period_json(raw))
+
+        path = self.root / "app-periods.json"
+        path.write_text(raw, encoding="utf-8")
+        self.assertEqual(
+            await self.bot._extract_period_times(event(), ComponentFile("app-periods.json", path)),
+            expected,
+        )
+        self.context.llm_generate.assert_not_awaited()
+
+        async def direct_paste():
+            send = AsyncMock()
+            starter = SimpleNamespace(
+                **vars(event()), message_str="", get_messages=lambda: [],
+                plain_result=str, send=send, stop_event=Mock(),
+            )
+            submitted = SimpleNamespace(
+                **vars(event()), message_str=raw, get_messages=lambda: [],
+                plain_result=str, send=send, stop_event=Mock(),
+            )
+            controller = SimpleNamespace(
+                future=SimpleNamespace(done=lambda: False), stop=Mock(), keep=Mock(),
+            )
+
+            def session_waiter(**kwargs):
+                def decorate(callback):
+                    async def run(_, session_filter):
+                        await callback(controller, submitted)
+                    return run
+                return decorate
+
+            with patch.object(plugin, "session_waiter", session_waiter):
+                replies = [value async for value in self.bot.set_period_times(starter)]
+            self.assertTrue(replies)
+            controller.stop.assert_called_once()
+
+        await direct_paste()
+        self.assertEqual(self.storage.get_period_times(BIND, "001"), expected)
+        self.context.llm_generate.assert_not_awaited()
+
+    async def test_invalid_app_timetable_export_never_falls_back_to_ai(self):
+        cases = []
+        duplicate = app_timetable_export()
+        duplicate["data"]["items"][1]["section"] = 1
+        cases.append(("duplicate", duplicate))
+        boolean_hour = app_timetable_export()
+        boolean_hour["data"]["items"][0]["startHour"] = True
+        cases.append(("boolean", boolean_hour))
+        invalid_minute = app_timetable_export()
+        invalid_minute["data"]["items"][0]["startMinute"] = 60
+        cases.append(("minute", invalid_minute))
+        overlapping = app_timetable_export()
+        overlapping["data"]["items"][1]["startHour"] = 9
+        overlapping["data"]["items"][1]["startMinute"] = 0
+        cases.append(("overlap", overlapping))
+        invalid_hour = app_timetable_export()
+        invalid_hour["data"]["items"][0]["endHour"] = 24
+        cases.append(("hour", invalid_hour))
+        special = app_timetable_export()
+        special["data"]["specialPeriods"] = [{"section": 1}]
+        cases.append(("special", special))
+
+        for name, value in cases:
+            with self.subTest(name=name), self.assertRaises(importer.ImportProblem):
+                plugin.parse_period_times(json.dumps(value, ensure_ascii=False))
+
+        malformed = json.dumps(cases[1][1], ensure_ascii=False)
+        self.assertTrue(plugin._looks_like_period_json(malformed))
+        for name in ("bad-app.json", "bad-app.txt"):
+            with self.subTest(name=name):
+                malformed_file = self.root / name
+                malformed_file.write_text(malformed, encoding="utf-8")
+                with self.assertRaises(importer.ImportProblem):
+                    await self.bot._extract_period_times(event(), ComponentFile(name, malformed_file))
         self.context.llm_generate.assert_not_awaited()
 
     def test_period_profile_write_failure_preserves_previous_profile(self):
