@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -12,6 +13,7 @@ from astrbot.api import logger
 from astrbot.api.star import StarTools
 
 from .course_types import UserBinding
+from .period_times import MAX_INPUT, parse_period_times
 
 
 class CourseStorage:
@@ -48,6 +50,7 @@ class CourseStorage:
                     ),
                     daily_push_job_id=str(item.get("daily_push_job_id", "")),
                     group_reminders={k: v for k, v in overrides.items() if isinstance(v, bool)},
+                    period_times_trusted=item.get("period_times_trusted") is True,
                 )
             return bindings
         except Exception as e:
@@ -93,7 +96,7 @@ class CourseStorage:
             logger.warning(f"[course] old calendar cleanup failed ({type(exc).__name__})")
 
     def store_calendar(
-        self, *, user_id: str, origin: str, nickname: str, content: bytes,
+        self, *, user_id: str, origin: str, nickname: str, content: bytes, period_times_trusted: bool = False,
     ) -> UserBinding:
         bindings = self.load_bindings()
         previous = bindings.get(user_id)
@@ -109,9 +112,9 @@ class CourseStorage:
             relative_path = calendar.resolve().relative_to(self._base_dir.resolve()).as_posix()
             updated = time.time()
             if previous:
-                binding = replace(previous, nickname=nickname, ics_file=relative_path, updated_at_ts=updated)
+                binding = replace(previous, nickname=nickname, ics_file=relative_path, updated_at_ts=updated, period_times_trusted=period_times_trusted is True)
             else:
-                binding = UserBinding(user_id, origin, nickname, relative_path, updated)
+                binding = UserBinding(user_id, origin, nickname, relative_path, updated, period_times_trusted=period_times_trusted is True)
             bindings[user_id] = binding
             self.save_bindings(bindings)
         except BaseException:
@@ -132,3 +135,29 @@ class CourseStorage:
 
     def get_binding(self, user_id: str) -> Optional[UserBinding]:
         return self.load_bindings().get(user_id)
+
+    def _period_path(self, origin: str, user_id: str) -> Path:
+        scope = json.dumps([origin.split(":", 1)[0], user_id], separators=(",", ":"))
+        digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()
+        return self._base_dir / f"period-times-{digest}.json"
+
+    def get_period_times(self, origin: str, user_id: str) -> dict[int, tuple[str, str]]:
+        try:
+            with self._period_path(origin, user_id).open("rb") as handle:
+                return parse_period_times(handle.read(MAX_INPUT + 1), json_only=True)
+        except (ValueError, OSError):
+            return {}
+
+    def save_period_times(self, origin: str, user_id: str, times: dict[int, tuple[str, str]]) -> None:
+        validated = parse_period_times(times)
+        target = self._period_path(origin, user_id)
+        fd, temp = tempfile.mkstemp(dir=self._base_dir, prefix="period-times-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump({str(k): list(v) for k, v in validated.items()}, handle, ensure_ascii=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, target)
+        finally:
+            if os.path.exists(temp):
+                os.unlink(temp)

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, field
+from dataclasses import dataclass, field
 from datetime import datetime
+
+MAX_PERIOD = 40
 
 
 @dataclass(frozen=True)
@@ -11,6 +13,8 @@ class CourseEvent:
     end_time: datetime
     location: str = ""
     description: str = ""
+    first_period: int | None = None
+    last_period: int | None = None
 
     def reminder_key(self) -> str:
         return "|".join(
@@ -37,3 +41,4 @@ class UserBinding:
     daily_push_job_id: str = ""
     # Explicit overrides for each group conversation; the binding group defaults on.
     group_reminders: dict[str, bool] = field(default_factory=dict)
+    period_times_trusted: bool = False

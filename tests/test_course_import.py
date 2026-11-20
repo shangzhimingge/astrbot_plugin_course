@@ -1,3 +1,4 @@
+import ast
 import importlib
 import json
 import sys
@@ -84,6 +85,11 @@ def load_plugin():
         plugin = importlib.import_module(f"{PACKAGE}.main")
         imported = importlib.import_module(f"{PACKAGE}.importer")
         storage = importlib.import_module(f"{PACKAGE}.storage")
+        package_modules = {
+            name: module for name, module in sys.modules.items()
+            if name == PACKAGE or name.startswith(f"{PACKAGE}.")
+        }
+    sys.modules.update(package_modules)
     return plugin, imported, storage
 
 
@@ -217,10 +223,12 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
     async def test_ics_bypasses_ai_and_document_uses_provider(self):
         p = self.root / "adapter.tmp"
         p.write_bytes(importer.parse_model_result(completion(), plugin.SHANGHAI_TZ))
-        await self.bot._extract_schedule(event(), ComponentFile("course.ics", p), "")
+        _, is_ai = await self.bot._extract_schedule(event(), ComponentFile("course.ics", p), "")
+        self.assertFalse(is_ai)
         self.context.llm_generate.assert_not_awaited()
         p.write_text('{"semester":"fall"}', encoding="utf-8")
-        result = await self.bot._extract_schedule(event(), ComponentFile("course.json", p), "第一周周一 2026-09-07")
+        result, is_ai = await self.bot._extract_schedule(event(), ComponentFile("course.json", p), "第一周周一 2026-09-07")
+        self.assertTrue(is_ai)
         importer.validate_ics(result)
         self.context.get_current_chat_provider_id.assert_awaited_once_with(BIND)
         request = self.context.llm_generate.await_args.kwargs
@@ -250,7 +258,8 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         from PIL import Image
         p = self.root / "schedule.png"
         Image.new("RGB", (24, 24)).save(p)
-        result = await self.bot._extract_schedule(event(), ComponentImage(p), "")
+        result, is_ai = await self.bot._extract_schedule(event(), ComponentImage(p), "")
+        self.assertTrue(is_ai)
         importer.validate_ics(result)
         self.assertEqual(self.context.llm_generate.await_args.kwargs["image_urls"], [str(p)])
 
@@ -302,6 +311,167 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             image.url = "https://example.invalid/schedule.png"
             await self.bot._extract_schedule(event(), image, "")
             self.assertFalse(p.exists())
+
+    def test_saved_periods_retime_only_trusted_indexed_events_without_altering_ics(self):
+        row = json.loads(completion())["courses"][0]
+        row.update(first_period=1, last_period=2)
+        unindexed = dict(row, summary="按钟点", start="07:00", end="07:30")
+        del unindexed["first_period"], unindexed["last_period"]
+        calendar = importer.parse_model_result(
+            json.dumps({"courses": [row, unindexed]}), plugin.SHANGHAI_TZ
+        )
+        binding = self.storage.store_calendar(
+            user_id="001", origin=BIND, nickname="同学", content=calendar,
+            period_times_trusted=True,
+        )
+        p = self.root / binding.ics_file
+
+        def hours(current_binding):
+            return {course.summary: (course.start_time.strftime("%H:%M"), course.end_time.strftime("%H:%M"))
+                    for course in self.bot._events_for_binding(current_binding)}
+
+        self.assertEqual(hours(binding)["程序设计"], ("08:00", "09:30"))  # warm base cache
+        new_table = {1: ("10:15", "11:00"), 2: ("11:05", "11:50")}
+        self.storage.save_period_times(OTHER, "001", new_table)
+        self.assertEqual(self.storage.get_period_times(BIND, "001"), new_table)
+        self.assertEqual(self.storage.get_period_times(FOREIGN, "001"), {})
+        self.assertEqual(self.storage.get_period_times(BIND, "002"), {})
+        self.assertTrue(self.storage.get_binding("001").period_times_trusted)
+        self.assertEqual(hours(binding), {"按钟点": ("07:00", "07:30"), "程序设计": ("10:15", "11:50")})
+        self.assertEqual(p.read_bytes(), calendar)
+        self.storage.save_period_times(OTHER, "001", {1: new_table[1]})
+        self.assertEqual(hours(binding)["程序设计"], ("08:00", "09:30"))
+        self.storage.save_period_times(OTHER, "001", new_table)
+        untrusted = self.storage.store_calendar(user_id="001", origin=OTHER, nickname="同学", content=calendar)
+        self.assertFalse(untrusted.period_times_trusted)
+        self.assertEqual(hours(untrusted)["程序设计"], ("08:00", "09:30"))
+
+    def test_model_periods_only_require_a_complete_range(self):
+        row = json.loads(completion())["courses"][0]
+        del row["start"], row["end"]
+        row.update(first_period=1, last_period=3)
+        data = json.dumps({"courses": [row]})
+        table = {1: ("08:25", "09:10"), 2: ("09:15", "10:00"), 3: ("10:15", "11:00")}
+        calendar = importer.parse_model_result(data, plugin.SHANGHAI_TZ, table)
+        meeting, = Calendar.from_ical(calendar).walk("VEVENT")
+        self.assertEqual(meeting.decoded("dtstart").astimezone(plugin.SHANGHAI_TZ).strftime("%H:%M"), "08:25")
+        self.assertEqual(meeting.decoded("dtend").astimezone(plugin.SHANGHAI_TZ).strftime("%H:%M"), "11:00")
+        with self.assertRaises(importer.ImportProblem):
+            importer.parse_model_result(data, plugin.SHANGHAI_TZ, {1: table[1], 3: table[3]})
+
+    async def test_period_command_formats_and_owner_guard(self):
+        from PIL import Image
+
+        expected = {1: ("08:25", "09:10"), 2: ("09:15", "10:00")}
+        as_json = json.dumps({"1": ["08:25", "09:10"], "2": ["09:15", "10:00"]})
+        file_path = self.root / "adapter.tmp"
+        file_path.write_text(as_json, encoding="utf-8")
+        img_path = self.root / "schedule.png"
+        Image.new("RGB", (20, 20)).save(img_path)
+
+        def message(origin=BIND, owner="001", text="", parts=()):
+            return SimpleNamespace(
+                **vars(event(origin, owner)), message_str=text, get_messages=lambda: parts,
+                plain_result=str, send=AsyncMock(), stop_event=Mock(),
+            )
+
+        for text, parts in [
+            ("第1节 08:25-09:10\n第2节 09:15-10:00", []),
+            (as_json, []),
+            ("", [ComponentFile("course.json", file_path)]),
+            ("", [ComponentImage(img_path)]),
+        ]:
+            with self.subTest(parts=parts, text=text):
+                old = {1: ("07:00", "07:45")}
+                self.storage.save_period_times(BIND, "001", old)
+                self.context.llm_generate.reset_mock()
+                self.context.llm_generate.return_value = SimpleNamespace(completion_text=as_json)
+                controller = SimpleNamespace(
+                    future=SimpleNamespace(done=lambda: False), stop=Mock(), keep=Mock(),
+                )
+
+                def session_waiter(**kwargs):
+                    def decorate(callback):
+                        async def run(_, session_filter):
+                            await callback(controller, message(owner="002", text=as_json))
+                            await callback(controller, message(origin=OTHER, text=as_json))
+                            await callback(controller, message(text="第1节 09:00-08:00"))
+                            self.assertEqual(self.storage.get_period_times(BIND, "001"), old)
+                            self.assertEqual(self.storage.get_period_times(BIND, "002"), {})
+                            await callback(controller, message(text=text, parts=parts))
+                        return run
+                    return decorate
+
+                with patch.object(plugin, "session_waiter", session_waiter):
+                    replies = [value async for value in self.bot.set_period_times(message())]
+                self.assertTrue(replies)
+                self.assertEqual(self.storage.get_period_times(BIND, "001"), expected)
+                self.assertIsNone(self.storage.get_binding("001"))  # Configurable before binding.
+                controller.stop.assert_called_once()
+                if parts and isinstance(parts[0], ComponentImage):
+                    self.assertEqual(self.context.llm_generate.await_args.kwargs["image_urls"], [str(img_path)])
+                else:
+                    self.context.llm_generate.assert_not_awaited()
+
+    async def test_period_file_keeps_raw_json_validation_and_handles_utf8_text(self):
+        path = self.root / "adapter.tmp"
+        path.write_bytes(b'{"1":["08:25","09:10"],"1":["09:15","10:00"]}')
+        with self.assertRaises(importer.ImportProblem):
+            await self.bot._extract_period_times(event(), ComponentFile("period.json", path))
+
+        path.write_bytes(b" " * (plugin.MAX_INPUT + 1))
+        with self.assertRaises(importer.ImportProblem):
+            await self.bot._extract_period_times(event(), ComponentFile("period.json", path))
+
+        path.write_text("第1节 08:25-09:10", encoding="utf-8-sig")
+        self.assertEqual(
+            await self.bot._extract_period_times(event(), ComponentFile("period.txt", path)),
+            {1: ("08:25", "09:10")},
+        )
+        self.context.llm_generate.assert_not_awaited()
+
+    def test_period_profile_write_failure_preserves_previous_profile(self):
+        original = {1: ("08:25", "09:10")}
+        self.storage.save_period_times(BIND, "001", original)
+        with patch.object(storage_module.os, "replace", side_effect=OSError("locked")):
+            with self.assertRaises(OSError):
+                self.storage.save_period_times(BIND, "001", {1: ("09:15", "10:00")})
+        self.assertEqual(self.storage.get_period_times(OTHER, "001"), original)
+        self.assertFalse(list(self.root.glob("period-times-*.tmp")))
+
+    async def test_retimed_course_drives_reminder(self):
+        fixed = datetime.now(plugin.SHANGHAI_TZ).replace(hour=9, minute=55, second=0, microsecond=0)
+
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed.astimezone(tz) if tz else fixed.replace(tzinfo=None)
+
+        row = json.loads(completion(fixed.date().isoformat()))["courses"][0]
+        row.update(first_period=1, last_period=1)
+        data = importer.parse_model_result(json.dumps({"courses": [row]}), plugin.SHANGHAI_TZ)
+        self.storage.store_calendar(
+            user_id="001", origin=BIND, nickname="同学", content=data, period_times_trusted=True,
+        )
+        with patch.object(plugin, "datetime", Clock):
+            await self.bot._tick_reminder()
+            self.context.send_message.assert_not_awaited()
+            self.storage.save_period_times(BIND, "001", {1: ("10:00", "10:45")})
+            await self.bot._tick_reminder()
+        self.context.send_message.assert_awaited_once()
+        self.assertEqual(self.context.send_message.await_args.args[0], BIND)
+        self.assertIn("程序设计", self.context.send_message.await_args.args[1].text)
+
+    def test_all_schedule_consumers_use_shared_read_path(self):
+        tree = ast.parse((ROOT / "main.py").read_text(encoding="utf-8"))
+        class_node = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "CoursePlugin")
+        callers = {
+            node.name for node in class_node.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and any(isinstance(child, ast.Attribute) and child.attr == "_events_for_binding"
+                    for child in ast.walk(node))
+        }
+        self.assertEqual(callers, {"week", "next_week", "_send_day_schedule", "_daily_push_handler", "_tick_reminder"})
 
     def test_cross_group_identity_defaults_and_persisted_opt_out(self):
         old = self.store()

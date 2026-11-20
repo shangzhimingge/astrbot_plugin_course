@@ -6,7 +6,7 @@ from astrbot.api import logger
 from icalendar import Calendar
 from dateutil.rrule import rrulestr
 
-from .course_types import CourseEvent
+from .course_types import MAX_PERIOD, CourseEvent
 
 
 SHANGHAI_TZ = timezone(timedelta(hours=8))
@@ -24,7 +24,8 @@ class IcsParser:
             return self._cache[file_path]
 
         try:
-            cal_content = open(file_path, "r", encoding="utf-8").read()
+            with open(file_path, "r", encoding="utf-8") as handle:
+                cal_content = handle.read()
         except Exception as e:
             logger.error(f"[course] cannot read ics: {e}")
             return []
@@ -46,6 +47,15 @@ class IcsParser:
                 summary = str(component.get("summary") or "")
                 description = str(component.get("description") or "")
                 location = str(component.get("location") or "")
+                first_period = component.get("X-COURSE-FIRST-PERIOD")
+                last_period = component.get("X-COURSE-LAST-PERIOD")
+                try:
+                    first_period = int(str(first_period)) if first_period is not None else None
+                    last_period = int(str(last_period)) if last_period is not None else first_period
+                    if first_period is None or last_period is None or not 1 <= first_period <= last_period <= MAX_PERIOD:
+                        first_period = last_period = None
+                except (ValueError, TypeError):
+                    first_period = last_period = None
                 dtstart_obj = component.get("dtstart")
                 dtend_obj = component.get("dtend")
                 if not dtstart_obj or not dtend_obj:
@@ -103,6 +113,7 @@ class IcsParser:
                                 location=location,
                                 start_time=occ_local,
                                 end_time=occ_local + duration,
+                                first_period=first_period, last_period=last_period,
                             )
                         )
 
@@ -115,6 +126,7 @@ class IcsParser:
                                 location=location,
                                 start_time=dtstart,
                                 end_time=dtend,
+                                first_period=first_period, last_period=last_period,
                             )
                         )
             except Exception as e:
