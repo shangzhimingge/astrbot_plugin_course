@@ -293,6 +293,63 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         importer.validate_ics(result)
         self.assertEqual(self.context.llm_generate.await_args.kwargs["image_urls"], [str(p)])
 
+    async def test_dedicated_vision_provider_routes_only_image_requests(self):
+        from PIL import Image
+        p = self.root / "schedule.png"
+        Image.new("RGB", (24, 24)).save(p)
+        vision = SimpleNamespace(meta=lambda: SimpleNamespace(id="vision"))
+        self.bot._plugin_config = {"vision_provider_id": "vision", "import_provider_id": "text"}
+        self.context.get_all_providers.return_value = [
+            vision, SimpleNamespace(meta=lambda: SimpleNamespace(id="text")),
+        ]
+        # Dedicated image routing is independent of the configured text provider.
+        await self.bot._extract_schedule(event(), ComponentImage(p), "")
+        self.assertEqual(self.context.llm_generate.await_args.kwargs["chat_provider_id"], "vision")
+        self.context.llm_generate.reset_mock()
+        doc = self.root / "course.json"
+        doc.write_text('{"course":"Math"}', encoding="utf-8")
+        await self.bot._extract_schedule(event(), ComponentFile("course.json", doc), "")
+        self.assertEqual(self.context.llm_generate.await_args.kwargs["chat_provider_id"], "text")
+
+    async def test_vision_provider_routes_file_images_and_period_images(self):
+        from PIL import Image
+        p = self.root / "schedule.png"
+        Image.new("RGB", (24, 24)).save(p)
+        self.bot._plugin_config = {"vision_provider_id": "vision", "import_provider_id": "missing"}
+        self.context.get_all_providers.return_value = [
+            SimpleNamespace(meta=lambda: SimpleNamespace(id="vision")),
+        ]
+        await self.bot._extract_schedule(event(), ComponentFile("schedule.png", p), "")
+        self.assertEqual(self.context.llm_generate.await_args.kwargs["chat_provider_id"], "vision")
+        self.context.llm_generate.reset_mock()
+        self.context.llm_generate.return_value = SimpleNamespace(completion_text='{"1":["08:00","08:45"]}')
+        await self.bot._extract_period_times(event(), ComponentImage(p))
+        self.assertEqual(self.context.llm_generate.await_args.kwargs["chat_provider_id"], "vision")
+
+    async def test_missing_dedicated_vision_provider_fails_closed_only_for_images(self):
+        from PIL import Image
+        p = self.root / "schedule.png"
+        Image.new("RGB", (24, 24)).save(p)
+        self.bot._plugin_config = {"vision_provider_id": "missing"}
+        with self.assertRaisesRegex(importer.ImportProblem, "视觉识别模型"):
+            await self.bot._extract_schedule(event(), ComponentImage(p), "")
+        self.context.llm_generate.assert_not_awaited()
+        self.context.get_current_chat_provider_id.assert_not_awaited()
+        doc = self.root / "course.json"
+        doc.write_text('{"course":"Math"}', encoding="utf-8")
+        await self.bot._extract_schedule(event(), ComponentFile("course.json", doc), "")
+        self.assertEqual(self.context.llm_generate.await_args.kwargs["chat_provider_id"], "provider")
+
+    async def test_blank_vision_uses_import_provider_and_reports_its_missing_setting(self):
+        from PIL import Image
+        p = self.root / "schedule.png"
+        Image.new("RGB", (24, 24)).save(p)
+        self.bot._plugin_config = {"vision_provider_id": "  ", "import_provider_id": "stale"}
+        with self.assertRaisesRegex(importer.ImportProblem, "课表解析模型"):
+            await self.bot._extract_schedule(event(), ComponentImage(p), "")
+        self.context.llm_generate.assert_not_awaited()
+        self.context.get_current_chat_provider_id.assert_not_awaited()
+
     async def test_selected_import_provider_is_used(self):
         p = self.root / "course.json"
         p.write_text('{"course":"Math"}', encoding="utf-8")
@@ -316,6 +373,10 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         setting = schema["import_provider_id"]
         self.assertEqual((setting["type"], setting["default"], setting["_special"]),
                          ("string", "", "select_provider"))
+        vision = schema["vision_provider_id"]
+        self.assertEqual((vision["type"], vision["default"], vision["_special"]),
+                         ("string", "", "select_provider"))
+        self.assertIn("视觉识别模型", vision["description"])
 
     async def test_binding_waiter_only_imports_the_owners_attachment(self):
         p = self.root / "adapter.json"

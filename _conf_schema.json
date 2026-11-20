@@ -2,7 +2,14 @@
   "import_provider_id": {
     "type": "string",
     "description": "课表解析模型",
-    "hint": "留空时跟随当前会话模型；用于课表附件和 /课表时间 图片识别，不影响普通对话或全局模型配置。图片需要支持视觉输入的模型。",
+    "hint": "用于课表附件文字解析，以及视觉识别模型留空时的图片识别。留空时跟随当前会话模型；图片所用模型需支持视觉输入。",
+    "_special": "select_provider",
+    "default": ""
+  },
+  "vision_provider_id": {
+    "type": "string",
+    "description": "视觉识别模型",
+    "hint": "仅用于课表附件图片解析和 /课表时间 图片识别；选择支持视觉输入的模型。留空时沿用课表解析模型；课表解析模型也留空时，图片使用当前会话模型。",
     "_special": "select_provider",
     "default": ""
   }

@@ -167,7 +167,7 @@ class CoursePlugin(Star):
         try:
             yield event.plain_result(
                 "请在 120 秒内发送一份课表文件或图片：ICS、Excel、Word (.docx)、PDF、JSON、HTML、PNG/JPG/WEBP。\n"
-                "非 ICS 内容会交给插件配置的课表解析模型识别（留空则跟随当前会话）。若课表只有周次，可先发「课表补充 第一周周一 YYYY-MM-DD」；"
+                "非 ICS 文档使用课表解析模型，图片优先使用已配置的视觉识别模型。若课表只有周次，可先发「课表补充 第一周周一 YYYY-MM-DD」；"
                 "只有节次时可先用 /课表时间 保存作息。发送「退出」取消。"
             )
 
@@ -282,7 +282,7 @@ class CoursePlugin(Star):
                 {"日历补充信息": caption[:800], "附件可读数据": content if kind == "text" else ""},
                 ensure_ascii=False,
             )
-            provider = await self._resolve_import_provider(event.unified_msg_origin)
+            provider = await self._resolve_import_provider(event.unified_msg_origin, image=kind == "image")
             response = await self._context.llm_generate(
                 chat_provider_id=provider, prompt=prompt, system_prompt=SYSTEM_PROMPT,
                 image_urls=[content] if kind == "image" else None,
@@ -321,7 +321,7 @@ class CoursePlugin(Star):
             if suffix in {".json", ".txt"}:
                 return await asyncio.to_thread(_read_period_file, path, suffix == ".json")
             _, image_path = await asyncio.to_thread(extract, path, suffix)
-            provider = await self._resolve_import_provider(event.unified_msg_origin)
+            provider = await self._resolve_import_provider(event.unified_msg_origin, image=True)
             answer = await self._context.llm_generate(
                 chat_provider_id=provider,
                 prompt='读取作息表的节次和起止时刻，按 JSON 返回，例如 {"1":["08:00","08:45"]}。',
@@ -331,17 +331,22 @@ class CoursePlugin(Star):
             )
             return await asyncio.to_thread(parse_period_times, answer.completion_text, json_only=True)
 
-    async def _resolve_import_provider(self, umo: str) -> str:
-        raw_configured = self._plugin_config.get("import_provider_id", "")
-        configured = raw_configured.strip() if isinstance(raw_configured, str) else ""
-        if not configured:
-            return await self._context.get_current_chat_provider_id(umo)
-        providers = self._context.get_all_providers()
-        if not any(provider.meta().id == configured for provider in providers):
-            raise ImportProblem(
-                "插件配置的课表解析模型当前不可用，请在插件配置页选择已启用的聊天模型，或清空该项以跟随当前会话模型。"
-            )
-        return configured
+    async def _resolve_import_provider(self, umo: str, *, image: bool = False) -> str:
+        options = (("import_provider_id", "课表解析模型"),)
+        if image:
+            options = (("vision_provider_id", "视觉识别模型"),) + options
+        for option, label in options:
+            raw_configured = self._plugin_config.get(option, "")
+            configured = raw_configured.strip() if isinstance(raw_configured, str) else ""
+            if not configured:
+                continue
+            providers = self._context.get_all_providers()
+            if not any(provider.meta().id == configured for provider in providers):
+                raise ImportProblem(
+                    f"插件配置的{label}当前不可用，请在插件配置页选择已启用的聊天模型，或清空该项以沿用其他模型选择。"
+                )
+            return configured
+        return await self._context.get_current_chat_provider_id(umo)
 
     @filter.command("课表时间")
     async def set_period_times(self, event: AstrMessageEvent):
